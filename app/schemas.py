@@ -225,6 +225,25 @@ class DriftRiskResult(BaseModel):
     )
 
 
+# ------------------------------------------------ 多站点原子批量分析
+
+class BatchAnalysisRequest(BaseModel):
+    """多站点原子批量分析请求：1～10 个不重复的已保存站点 ID。"""
+
+    site_ids: list[int] = Field(
+        ..., min_length=1, max_length=10, description="已保存站点 ID 列表，取 1～10 个，按给定顺序逐站分析，不允许重复"
+    )
+
+    @field_validator("site_ids")
+    @classmethod
+    def _check_site_ids(cls, v: list[int]) -> list[int]:
+        if any(site_id <= 0 for site_id in v):
+            raise ValueError("site ids must be positive integers")
+        if len(set(v)) != len(v):
+            raise ValueError("duplicate site ids are not allowed")
+        return v
+
+
 # ------------------------------------------------ 跨站点冲突检测
 
 class CrossSiteConflictsRequest(BaseModel):

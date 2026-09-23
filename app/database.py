@@ -369,6 +369,46 @@ def prune_analyses(site_id: int, keep: int) -> tuple[list[int], int] | None:
 
 # ---------------------------------------------------------------- 跨站点批量查询
 
+def fetch_sites_by_ids(site_ids: list[int]) -> dict[int, SiteOut]:
+    """批量读取站点完整配置，返回 {site_id: SiteOut}（单次查询，顺序无关）。"""
+    if not site_ids:
+        return {}
+    placeholders = ",".join("?" for _ in site_ids)
+    with connect() as con:
+        rows = con.execute(
+            f"SELECT * FROM sites WHERE id IN ({placeholders})", site_ids
+        ).fetchall()
+        return {row["id"]: _row_to_site(con, row) for row in rows}
+
+
+def save_analyses_batch(
+    sites: list[SiteOut],
+    compute_products: Callable[[SiteOut], list[ProductOut]],
+) -> list[AnalysisResult]:
+    """在同一个事务内按输入顺序逐站执行分析并保存，返回同序的分析结果列表。
+
+    逐站“计算 -> 写入 analyses”，全部站点的分析记录随同一个事务提交；
+    任一站点的计算或写入失败都会整体回滚（整批拒绝），不产生任何部分结果。
+    站点存在性由调用方在事务开始前检查（任一站点不存在直接 404，不进入本函数）。
+    """
+    results: list[AnalysisResult] = []
+    with connect() as con:
+        for site in sites:
+            products = compute_products(site)
+            result_json = json.dumps([p.model_dump() for p in products])
+            cur = con.execute(
+                "INSERT INTO analyses (site_id, product_count, result_json) VALUES (?, ?, ?)",
+                (site.id, len(products), result_json),
+            )
+            row = con.execute(
+                "SELECT id, site_id, created_at, product_count, result_json"
+                " FROM analyses WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            results.append(_row_to_result(row))
+    return results
+
+
 def fetch_existing_site_ids(site_ids: list[int]) -> set[int]:
     """返回给定 id 中实际存在的站点 id 集合（单次查询）。"""
     if not site_ids:

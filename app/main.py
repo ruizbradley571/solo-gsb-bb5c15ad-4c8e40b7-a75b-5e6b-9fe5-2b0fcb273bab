@@ -18,6 +18,7 @@ from .analysis import (
 from .schemas import (
     AnalysisMeta,
     AnalysisResult,
+    BatchAnalysisRequest,
     CarrierExclusionResult,
     CrossSiteConflictsRequest,
     CrossSiteConflictsResponse,
@@ -236,6 +237,48 @@ def run_analysis(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return result
+
+
+@app.post(
+    "/sites/analyses/batch",
+    response_model=list[AnalysisResult],
+    status_code=status.HTTP_201_CREATED,
+    tags=["analysis"],
+    summary="多站点原子批量分析：按输入顺序逐站执行并保存，全部记录同一事务提交",
+    description=(
+        "接收 **1～10 个不重复**的已保存站点 ID（数量越界、重复或非正整数 → "
+        "422）。任一站点不存在时整批返回 **404**，不执行分析、不保存任何结果。\n\n"
+        "全部站点存在时，按**输入顺序**对每个站点执行与 "
+        "`POST /sites/{site_id}/analysis`（不带 `Idempotency-Key`）相同的分析"
+        "逻辑并逐站保存；全部分析记录在**同一个 SQLite 事务**中提交——任一站点"
+        "的计算或写入失败都会整批回滚，不产生任何部分结果。成功返回 `201` 与"
+        "输入顺序一致、一一对应的分析结果列表。\n\n"
+        "批量接口不接受 `Idempotency-Key`：每次调用都为每个站点新增一条分析"
+        "记录；单站接口的幂等键行为保持不变。"
+    ),
+)
+def run_batch_analysis(payload: BatchAnalysisRequest) -> list[AnalysisResult]:
+    site_ids = payload.site_ids
+    sites_by_id = database.fetch_sites_by_ids(site_ids)
+    missing = sorted(set(site_ids) - set(sites_by_id))
+    if missing:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"site(s) not found: {', '.join(str(s) for s in missing)}",
+        )
+    # 保持与请求 site_ids 一致的顺序逐站分析
+    sites = [sites_by_id[site_id] for site_id in site_ids]
+
+    def compute_products(site: SiteOut) -> list[ProductOut]:
+        return analyze(
+            carriers_hz=site.carriers_hz,
+            scan_start_hz=site.scan_start_hz,
+            scan_end_hz=site.scan_end_hz,
+            guard_bands=site.guard_bands,
+            guard_interval_hz=site.guard_interval_hz,
+        )
+
+    return database.save_analyses_batch(sites, compute_products)
 
 
 @app.get(

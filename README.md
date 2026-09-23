@@ -296,6 +296,46 @@ curl -X POST http://localhost:8000/sites/1/analysis
 建议客户端为每个"逻辑上的一次分析"生成一个稳定的键（如 UUID 或业务流水号），仅在重试
 同一逻辑请求时复用；需要再做一次独立分析时使用新键或省略该头。
 
+## 多站点原子批量分析（batch analyses）
+
+`POST /sites/analyses/batch` 接收 **1～10 个不重复**的已保存站点 ID（数量越界、重复或
+非正整数 → `422`），按输入顺序逐站执行与 `POST /sites/{site_id}/analysis` 相同的分析
+逻辑并保存结果，一次调用为每个站点新增一条分析记录。
+
+- **任一站点不存在 → 整批 404**：先校验全部站点存在性，缺失时不执行分析、不保存任何结果。
+- **顺序一致**：按请求中的站点 ID 顺序逐站生成、逐站写入；成功返回与输入顺序一一对应的
+  分析结果列表（结构与单站分析响应完全相同）。
+- **单事务整批提交**：全部分析记录在**同一个 SQLite 事务**中提交，任一站点的计算或写入
+  失败都会整批回滚，不会出现部分站点已保存的中间状态；本批之前已存在的分析记录不受影响。
+- **不接受 `Idempotency-Key`**：批量接口每次调用都新增分析记录，也不会写入幂等登记表；
+  单站接口（含其幂等键行为）完全保持原样。
+
+```bash
+# 对站点 1、2、3 一次性批量分析：响应顺序与请求顺序一致，全部记录同事务提交
+curl -X POST http://localhost:8000/sites/analyses/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"site_ids": [3, 1, 2]}'
+```
+
+```json
+[
+  {"analysis_id": 1, "site_id": 3, "product_count": 1, "products": [ /* … */ ]},
+  {"analysis_id": 2, "site_id": 1, "product_count": 3, "products": [ /* … */ ]},
+  {"analysis_id": 3, "site_id": 2, "product_count": 2, "products": [ /* … */ ]}
+]
+```
+
+任一站点不存在时返回 `404`，整批不保存：
+
+```bash
+# 站点 999 不存在 -> 404，站点 1 也不会产生分析记录
+curl -i -X POST http://localhost:8000/sites/analyses/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"site_ids": [1, 999]}'
+# HTTP/1.1 404 Not Found
+# {"detail":"site(s) not found: 999"}
+```
+
 ## 分析历史保留清理（retention）
 
 `DELETE /sites/{site_id}/analyses/retention?keep=k` 清理该站点的分析历史：按
@@ -350,6 +390,7 @@ curl -X DELETE 'http://localhost:8000/sites/1/analyses/retention?keep=3'
 | `GET` | `/sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b` | 候选闭区间内不宜新增载频的最小区间并集（不执行或保存分析） |
 | `POST` | `/sites/{site_id}/drift-risk` | 载频独立漂移下的全频域潜在互调风险评估（不保存分析；映射缺失/重复/多余或容差非法 → 422，站点不存在 → 404） |
 | `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201`；可选 `Idempotency-Key` 请求头：同站点重复/并发同键返回首次结果（`200`）且不新增记录，空白键 `422` |
+| `POST` | `/sites/analyses/batch` | 多站点原子批量分析：1～10 个不重复站点 ID，按输入顺序逐站执行并保存，全部记录同一事务提交、失败整批回滚（任一站点不存在 → 404，参数非法 → 422），返回顺序一致的结果列表，`201` |
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
 | `DELETE` | `/sites/{site_id}/analyses/retention?keep=k` | 按 created_at、id 倒序保留最近 keep 条分析（1～100），单事务删除旧分析及其幂等键；站点不存在 → 404，参数非法 → 422 |
@@ -381,6 +422,11 @@ curl -X POST http://localhost:8000/sites/1/analysis \
   -H 'Idempotency-Key: run-001'
 curl -X POST http://localhost:8000/sites/1/analysis \
   -H 'Idempotency-Key: run-001'  # 200，响应与第一次完全一致
+
+# 多站点原子批量分析：1～10 个不重复站点 ID，顺序一致、同事务提交、失败整批回滚
+curl -X POST http://localhost:8000/sites/analyses/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"site_ids": [3, 1, 2]}'
 
 # 查询已保存的方案与分析结果
 curl http://localhost:8000/sites/1
@@ -477,8 +523,9 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（75 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
+# 运行测试（83 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
 # 新增载频禁用区间、载频漂移风险评估、跨站点冲突检测，幂等键的重复重放、失败回滚与并发去重，
+# 多站点原子批量分析的顺序保存、404 不保存与整批回滚，
 # 以及分析历史保留清理的倒序保留、幂等键联动删除与整批回滚）
 pytest
 
@@ -498,7 +545,7 @@ uvicorn app.main:app --reload
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
   analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合
-  database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、历史保留单事务清理、跨站点最近分析批量查询）
+  database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、多站点批量分析同事务写入、历史保留单事务清理、跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
   test_api.py   # 端到端测试（TestClient + 临时数据库）
