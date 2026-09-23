@@ -18,6 +18,7 @@ from .analysis import (
 from .schemas import (
     AnalysisMeta,
     AnalysisResult,
+    BatchAnalysisRequest,
     CarrierExclusionResult,
     CrossSiteConflictsRequest,
     CrossSiteConflictsResponse,
@@ -236,6 +237,49 @@ def run_analysis(
         status.HTTP_201_CREATED if created else status.HTTP_200_OK
     )
     return result
+
+
+@app.post(
+    "/sites/analyses/batch",
+    response_model=list[AnalysisResult],
+    status_code=status.HTTP_201_CREATED,
+    tags=["analysis"],
+    summary="多站点原子批量分析：按输入顺序逐站执行并保存",
+    description=(
+        "接收 1～10 个**不重复**的已保存站点 ID（正整数；数量越界、重复或"
+        "非正 → 422），按输入顺序逐站执行与 `POST /sites/{site_id}/analysis`"
+        "完全相同的分析逻辑并保存结果。\n\n"
+        "**整批原子**：站点存在性检查、各站分析计算与全部分析记录写入都在"
+        "**同一个 SQLite 事务**内完成——任一站点不存在即整批返回 404 且不"
+        "执行分析、不保存任何记录；任一计算或写入步骤失败则整批回滚，不会"
+        "出现部分站点已保存的中间状态。成功时返回 `201` 与**顺序与请求"
+        "`site_ids` 一致**的分析结果列表（每个站点新增一条分析记录，不支持"
+        "`Idempotency-Key` 幂等登记；单站接口行为不受影响）。"
+    ),
+)
+def run_analyses_batch(
+    payload: BatchAnalysisRequest,
+) -> list[AnalysisResult]:
+    site_ids = payload.site_ids
+
+    def compute_for_site(site: SiteOut) -> list[ProductOut]:
+        return analyze(
+            carriers_hz=site.carriers_hz,
+            scan_start_hz=site.scan_start_hz,
+            scan_end_hz=site.scan_end_hz,
+            guard_bands=site.guard_bands,
+            guard_interval_hz=site.guard_interval_hz,
+        )
+
+    results = database.save_analyses_batch(site_ids, compute_for_site)
+    if results is None:
+        existing = database.fetch_existing_site_ids(site_ids)
+        missing = sorted(set(site_ids) - existing)
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "site(s) not found: " + ", ".join(str(s) for s in missing),
+        )
+    return results
 
 
 @app.get(

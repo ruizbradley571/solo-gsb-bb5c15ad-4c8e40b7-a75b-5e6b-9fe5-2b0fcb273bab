@@ -265,6 +265,69 @@ def save_analysis_once(
         con.close()
 
 
+def save_analyses_batch(
+    site_ids: list[int],
+    compute_products: Callable[[SiteOut], list[ProductOut]],
+) -> list[AnalysisResult] | None:
+    """按输入顺序逐站执行并保存分析；全部记录在同一个事务内原子提交。
+
+    返回与 site_ids 同序的 AnalysisResult 列表；任一站点不存在时返回 None，
+    且不执行任何分析、不写入任何记录。
+
+    站点存在性检查、逐站分析计算（复用单站分析逻辑 compute_products）与全部
+    分析记录写入都在同一个 SQLite 事务（BEGIN IMMEDIATE，立即取得写锁）内完成：
+    任一站点不存在或任一步骤（计算/写入）失败都整体回滚，不会出现部分站点
+    已写入的中间状态。无幂等登记（idempotency_keys）行为。
+    """
+    con = sqlite3.connect(db_path(), timeout=IDEMPOTENT_BUSY_TIMEOUT_SECONDS)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    con.execute(f"PRAGMA busy_timeout = {int(IDEMPOTENT_BUSY_TIMEOUT_SECONDS * 1000)}")
+    # 与 save_analysis_once 一致手动控制事务，确保检查、计算与全部写入原子提交。
+    con.isolation_level = None
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        placeholders = ",".join("?" for _ in site_ids)
+        rows = con.execute(
+            f"SELECT * FROM sites WHERE id IN ({placeholders})", site_ids
+        ).fetchall()
+        if len(rows) != len(set(site_ids)):
+            # 任一站点不存在：整批拒绝，不执行分析、不写入任何记录
+            con.execute("ROLLBACK")
+            return None
+        site_by_id = {row["id"]: _row_to_site(con, row) for row in rows}
+
+        results: list[AnalysisResult] = []
+        for site_id in site_ids:  # 严格按输入顺序逐站计算并写入
+            site = site_by_id[site_id]
+            products = compute_products(site)
+            result_json = json.dumps([p.model_dump() for p in products])
+            cur = con.execute(
+                "INSERT INTO analyses (site_id, product_count, result_json) VALUES (?, ?, ?)",
+                (site_id, len(products), result_json),
+            )
+            analysis_id = cur.lastrowid
+            created_at = con.execute(
+                "SELECT created_at FROM analyses WHERE id = ?", (analysis_id,)
+            ).fetchone()["created_at"]
+            results.append(
+                _build_result(
+                    site_id, analysis_id, created_at, len(products), products
+                )
+            )
+        con.execute("COMMIT")
+        return results
+    except Exception:
+        # 计算或写入失败：全部分析记录随事务整体回滚
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass  # 事务已提交时不再回滚（保留原始异常向上抛出）
+        raise
+    finally:
+        con.close()
+
+
 def _build_result(
     site_id: int,
     analysis_id: int,

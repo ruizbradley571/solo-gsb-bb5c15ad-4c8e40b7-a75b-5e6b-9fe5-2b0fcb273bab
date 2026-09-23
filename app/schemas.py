@@ -100,6 +100,26 @@ class AnalysisMeta(BaseModel):
     product_count: int
 
 
+class BatchAnalysisRequest(BaseModel):
+    """多站点原子批量分析请求：1～10 个不重复的已保存站点 ID。"""
+
+    site_ids: list[int] = Field(
+        ...,
+        min_length=1,
+        max_length=10,
+        description="已保存站点 ID 列表，取 1～10 个正整数，不允许重复；分析结果按输入顺序返回",
+    )
+
+    @field_validator("site_ids")
+    @classmethod
+    def _check_site_ids(cls, v: list[int]) -> list[int]:
+        if any(site_id <= 0 for site_id in v):
+            raise ValueError("site ids must be positive integers")
+        if len(set(v)) != len(v):
+            raise ValueError("duplicate site ids are not allowed")
+        return v
+
+
 class RetentionResult(BaseModel):
     """分析历史保留清理结果：按 (created_at, id) 倒序保留最近 keep 条后的删除情况。"""
 

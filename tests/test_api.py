@@ -1314,6 +1314,159 @@ def test_cross_site_conflicts_eight_sites_limit(client):
     assert len(resp.json()["analyses"]) == 8
 
 
+# ---------------------------------------------------------------- 多站点原子批量分析
+
+def test_batch_analysis_creates_results_in_input_order(client):
+    # 三个站点产物不同：按输入顺序 [2, 1, 3] 返回，列表顺序与内容均一致；
+    # 每站新增一条分析记录，按写入顺序分配递增的 analysis_id。
+    _make_site(client, 1, carriers_hz=[100, 300, 400], scan_end_hz=10_000)
+    _make_site(client, 2, carriers_hz=[1000, 1200, 1500], scan_end_hz=10_000)
+    _make_site(client, 3, carriers_hz=[200, 500], scan_start_hz=500, scan_end_hz=900)
+
+    resp = client.post("/sites/analyses/batch", json={"site_ids": [2, 1, 3]})
+    assert resp.status_code == 201, resp.text
+    results = resp.json()
+    assert [r["site_id"] for r in results] == [2, 1, 3]
+    assert [r["freq_hz"] for r in results[0]["products"]] == [
+        500,
+        800,
+        900,
+        1400,
+        1800,
+        2000,
+    ]
+    assert [p["freq_hz"] for p in results[1]["products"]] == [200, 500, 700]
+    assert [p["freq_hz"] for p in results[2]["products"]] == [800]
+    # 按输入顺序逐站写入：analysis_id 递增
+    assert [r["analysis_id"] for r in results] == sorted(r["analysis_id"] for r in results)
+
+    # 每条结果都已持久化，且就是对应站点的最近一次分析
+    for result in results:
+        assert client.get(
+            f"/sites/{result['site_id']}/analysis"
+        ).json() == result
+        assert client.get(
+            f"/analyses/{result['analysis_id']}"
+        ).json() == result
+        assert len(client.get(f"/sites/{result['site_id']}/analyses").json()) == 1
+
+
+def test_batch_analysis_single_site(client):
+    # 单元素批次：结果与单站接口（不带 Idempotency-Key）的分析内容一致
+    client.post("/sites", json=make_payload())
+    batch = client.post("/sites/analyses/batch", json={"site_ids": [1]})
+    assert batch.status_code == 201, batch.text
+    batch_body = batch.json()[0]
+
+    single = client.post("/sites/1/analysis")
+    assert single.status_code == 201
+    assert single.json()["products"] == batch_body["products"]
+    assert single.json()["analysis_id"] > batch_body["analysis_id"]
+    # 两次调用各产生一条记录
+    assert [m["analysis_id"] for m in client.get("/sites/1/analyses").json()] == [
+        batch_body["analysis_id"],
+        single.json()["analysis_id"],
+    ]
+
+
+def test_batch_analysis_accepts_ten_sites(client):
+    # 10 个站点为允许上限
+    for i in range(1, 11):
+        _make_site(client, i)
+    resp = client.post(
+        "/sites/analyses/batch", json={"site_ids": list(range(10, 0, -1))}
+    )
+    assert resp.status_code == 201, resp.text
+    assert [r["site_id"] for r in resp.json()] == list(range(10, 0, -1))
+    for i in range(1, 11):
+        assert len(client.get(f"/sites/{i}/analyses").json()) == 1
+
+
+def test_batch_analysis_422_validation(client):
+    def post(body):
+        return client.post("/sites/analyses/batch", json=body)
+
+    # 空列表 / 超过 10 个
+    assert post({"site_ids": []}).status_code == 422
+    assert post({"site_ids": list(range(1, 12))}).status_code == 422
+    # 重复 / 非正整数
+    assert post({"site_ids": [1, 1]}).status_code == 422
+    assert post({"site_ids": [1, 0]}).status_code == 422
+    assert post({"site_ids": [1, -2]}).status_code == 422
+    # 缺整个请求体 / 缺字段
+    assert client.post("/sites/analyses/batch").status_code == 422
+    assert post({}).status_code == 422
+    assert post({"site_ids": ["x"]}).status_code == 422
+    assert post({"site_ids": [1.5]}).status_code == 422
+    # 校验先于站点查询：重复 ID 即使站点不存在也先 422
+    assert post({"site_ids": [998, 998]}).status_code == 422
+
+
+def test_batch_analysis_404_missing_site_saves_nothing(client):
+    _make_site(client, 1)
+    _make_site(client, 2)
+    # 任一站点不存在 -> 404（即使其他站点存在）
+    resp = client.post("/sites/analyses/batch", json={"site_ids": [2, 999, 1]})
+    assert resp.status_code == 404
+    assert "999" in resp.json()["detail"]
+    # 整批不保存：所有站点（包括存在的）都没有分析记录
+    for site_id in (1, 2):
+        assert client.get(f"/sites/{site_id}/analysis").status_code == 404
+        assert client.get(f"/sites/{site_id}/analyses").json() == []
+
+
+def test_batch_analysis_rolls_back_whole_batch_on_failure(client, monkeypatch):
+    # 计算过程中任一步失败：已计算/已写入的前序站点结果全部回滚
+    _make_site(client, 1, carriers_hz=[100, 300, 400])
+    _make_site(client, 2, carriers_hz=[1000, 1200, 1500])
+    from app import main as main_module
+
+    real_analyze = main_module.analyze
+
+    def fail_on_site_2(**kwargs):
+        # 路由层以关键字参数调用 analyze（与单站接口一致）；按载频区分站点
+        if kwargs["carriers_hz"] == [1000, 1200, 1500]:
+            raise RuntimeError("boom during batch analysis")
+        return real_analyze(**kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(main_module, "analyze", fail_on_site_2)
+        with pytest.raises(Exception, match="boom"):
+            client.post("/sites/analyses/batch", json={"site_ids": [1, 2]})
+
+    # 站点 1 虽先完成计算，但事务回滚后没有任何分析残留
+    assert client.get("/sites/1/analyses").json() == []
+    assert client.get("/sites/2/analyses").json() == []
+
+    # 恢复后整批重试：两站各成功保存一条
+    retry = client.post("/sites/analyses/batch", json={"site_ids": [2, 1]})
+    assert retry.status_code == 201, retry.text
+    assert [r["site_id"] for r in retry.json()] == [2, 1]
+    assert len(client.get("/sites/1/analyses").json()) == 1
+    assert len(client.get("/sites/2/analyses").json()) == 1
+
+
+def test_batch_analysis_does_not_affect_single_site_endpoint(client):
+    # 批量接口不支持幂等登记：每次调用都产生新记录；单站接口行为不变
+    _make_site(client, 1)
+    _make_site(client, 2)
+    first = client.post("/sites/analyses/batch", json={"site_ids": [1, 2]})
+    second = client.post("/sites/analyses/batch", json={"site_ids": [1, 2]})
+    assert first.status_code == 201 and second.status_code == 201
+    for a, b in zip(first.json(), second.json()):
+        assert b["analysis_id"] > a["analysis_id"]
+        assert b["products"] == a["products"]  # 输入相同，分析结果确定可复现
+    assert len(client.get("/sites/1/analyses").json()) == 2
+    assert len(client.get("/sites/2/analyses").json()) == 2
+
+    # 单站接口（带幂等键）行为保持原样
+    single = client.post("/sites/1/analysis", headers={"Idempotency-Key": "k1"})
+    assert single.status_code == 201
+    replay = client.post("/sites/1/analysis", headers={"Idempotency-Key": "k1"})
+    assert replay.status_code == 200
+    assert replay.json() == single.json()
+
+
 # ---------------------------------------------------------------- 载频漂移风险评估
 
 def _drift_body(tolerances):

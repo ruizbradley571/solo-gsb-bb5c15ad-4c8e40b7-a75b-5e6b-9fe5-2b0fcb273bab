@@ -296,6 +296,68 @@ curl -X POST http://localhost:8000/sites/1/analysis
 建议客户端为每个"逻辑上的一次分析"生成一个稳定的键（如 UUID 或业务流水号），仅在重试
 同一逻辑请求时复用；需要再做一次独立分析时使用新键或省略该头。
 
+## 多站点原子批量分析（batch analysis）
+
+`POST /sites/analyses/batch` 接收 **1～10 个不重复的已保存站点 ID**（正整数；
+列表为空、超过 10 个、ID 重复或非正 → `422`），**按输入顺序**逐站执行与单站接口
+`POST /sites/{site_id}/analysis` 完全相同的分析逻辑并保存结果。
+
+- **任一不存在即整批 404**：事务开始后先确认全部站点存在；任一站点不存在即整批返回
+  `404`，**不执行任何分析、不保存任何记录**。
+- **单事务整批提交/回滚**：站点存在性检查、各站分析计算与全部分析记录写入都在
+  **同一个 SQLite 事务**（`BEGIN IMMEDIATE` 立即取得写锁）内完成；任一计算或写入
+  步骤失败则整批回滚，不会出现部分站点已保存分析的中间状态。
+- **顺序一致的结果列表**：成功返回 `201`，响应为分析结果数组，第 `i` 项对应请求
+  `site_ids[i]`（含完整的 `analysis_id`、`created_at`、`products`）；每个站点新增
+  一条分析记录，按输入顺序逐站写入，分析 ID 随写入顺序递增。
+- **不支持幂等登记**：批量接口不接收 `Idempotency-Key`，每次调用都为每个站点执行并
+  保存一次新分析（分析结果由站点配置确定性决定，重复调用产物内容一致）。
+- **单站接口行为不变**：`POST /sites/{site_id}/analysis`（含 `Idempotency-Key`
+  语义）与全部既有查询接口保持原行为。
+
+```bash
+# 对站点 2、1、3 依次执行分析并在同一事务内保存；响应顺序与输入一致
+curl -X POST http://localhost:8000/sites/analyses/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"site_ids": [2, 1, 3]}'
+```
+
+```json
+[
+  {
+    "analysis_id": 1,
+    "site_id": 2,
+    "created_at": "2026-09-23T08:00:00.000Z",
+    "product_count": 6,
+    "products": [ /* 站点 2 的分析结果（与 POST /sites/2/analysis 响应同构） */ ]
+  },
+  {
+    "analysis_id": 2,
+    "site_id": 1,
+    "created_at": "2026-09-23T08:00:00.001Z",
+    "product_count": 3,
+    "products": [ /* 站点 1 的分析结果 */ ]
+  },
+  {
+    "analysis_id": 3,
+    "site_id": 3,
+    "created_at": "2026-09-23T08:00:00.002Z",
+    "product_count": 1,
+    "products": [ /* 站点 3 的分析结果 */ ]
+  }
+]
+```
+
+任一站点不存在时（下例站点 999 不存在）整批拒绝，已存在的站点也不会新增分析：
+
+```bash
+curl -i -X POST http://localhost:8000/sites/analyses/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"site_ids": [2, 999, 1]}'
+# HTTP/1.1 404 Not Found
+# {"detail":"site(s) not found: 999"}
+```
+
 ## 分析历史保留清理（retention）
 
 `DELETE /sites/{site_id}/analyses/retention?keep=k` 清理该站点的分析历史：按
@@ -350,6 +412,7 @@ curl -X DELETE 'http://localhost:8000/sites/1/analyses/retention?keep=3'
 | `GET` | `/sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b` | 候选闭区间内不宜新增载频的最小区间并集（不执行或保存分析） |
 | `POST` | `/sites/{site_id}/drift-risk` | 载频独立漂移下的全频域潜在互调风险评估（不保存分析；映射缺失/重复/多余或容差非法 → 422，站点不存在 → 404） |
 | `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201`；可选 `Idempotency-Key` 请求头：同站点重复/并发同键返回首次结果（`200`）且不新增记录，空白键 `422` |
+| `POST` | `/sites/analyses/batch` | 多站点原子批量分析：1～10 个不重复站点 ID 按输入顺序逐站分析并在同一事务内保存，`201` 返回同序结果列表；任一站点不存在 → `404` 且整批不保存，任一步骤失败整批回滚 |
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
 | `DELETE` | `/sites/{site_id}/analyses/retention?keep=k` | 按 created_at、id 倒序保留最近 keep 条分析（1～100），单事务删除旧分析及其幂等键；站点不存在 → 404，参数非法 → 422 |
@@ -381,6 +444,12 @@ curl -X POST http://localhost:8000/sites/1/analysis \
   -H 'Idempotency-Key: run-001'
 curl -X POST http://localhost:8000/sites/1/analysis \
   -H 'Idempotency-Key: run-001'  # 200，响应与第一次完全一致
+
+# 多站点原子批量分析：对站点 2、1、3 按输入顺序逐站分析，同一事务提交；
+# 任一站点不存在返回 404 且整批不保存
+curl -X POST http://localhost:8000/sites/analyses/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"site_ids": [2, 1, 3]}'
 
 # 查询已保存的方案与分析结果
 curl http://localhost:8000/sites/1
@@ -477,8 +546,9 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（75 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
+# 运行测试（82 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
 # 新增载频禁用区间、载频漂移风险评估、跨站点冲突检测，幂等键的重复重放、失败回滚与并发去重，
+# 多站点原子批量分析的顺序一致、404 整批不保存与失败整批回滚，
 # 以及分析历史保留清理的倒序保留、幂等键联动删除与整批回滚）
 pytest
 
@@ -496,9 +566,9 @@ uvicorn app.main:app --reload
 
 ```
 app/
-  main.py       # FastAPI 应用与路由，启动时初始化数据库
+  main.py       # FastAPI 应用与路由，启动时初始化数据库（含单站分析与多站点原子批量分析）
   analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合
-  database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、历史保留单事务清理、跨站点最近分析批量查询）
+  database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、多站点批量分析单事务提交、历史保留单事务清理、跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
   test_api.py   # 端到端测试（TestClient + 临时数据库）
